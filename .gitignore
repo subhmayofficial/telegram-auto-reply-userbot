@@ -1,0 +1,10 @@
+.env
+*.session
+*.session-journal
+venv/
+video.mp4
+video_thumb.jpg
+replied_users.json
+__pycache__/
+*.pyc
+.DS_Store
