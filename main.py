@@ -8,16 +8,18 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, RPCError
-from telethon.tl.types import DocumentAttributeVideo
+from telethon.tl.types import DocumentAttributeVideo, TypeDocumentAttribute
+from telethon.utils import get_attributes
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -197,7 +199,8 @@ def _probe_with_ffprobe(path: Path) -> Optional[VideoInfo]:
         stream = payload["streams"][0]
         width = int(stream["width"])
         height = int(stream["height"])
-        rotation = int(stream.get("tags", {}).get("rotate", 0) or 0)
+        tags = stream.get("tags") or {}
+        rotation = int(tags.get("rotate", 0) or 0)
         if rotation in (90, 270):
             width, height = height, width
 
@@ -269,6 +272,22 @@ def _probe_with_mdls(path: Path) -> Optional[VideoInfo]:
         return None
 
 
+def _probe_with_telethon(path: Path) -> Optional[VideoInfo]:
+    """Read video metadata via Telethon (uses hachoir, no ffprobe needed)."""
+    try:
+        attrs, _ = get_attributes(str(path), supports_streaming=True)
+        for attr in attrs:
+            if isinstance(attr, DocumentAttributeVideo) and attr.w > 1 and attr.h > 1:
+                return VideoInfo(
+                    width=int(attr.w),
+                    height=int(attr.h),
+                    duration=max(1, int(attr.duration)),
+                )
+    except Exception as exc:
+        logger.warning("Telethon/hachoir metadata read failed: %s", exc)
+    return None
+
+
 def _probe_from_env() -> Optional[VideoInfo]:
     """Optional manual override via .env if auto-detect fails."""
     load_dotenv(BASE_DIR / ".env")
@@ -291,24 +310,57 @@ def _probe_from_env() -> Optional[VideoInfo]:
 
 def load_video_info() -> VideoInfo:
     """Detect portrait/landscape video metadata for correct Telegram playback."""
-    candidates = (
-        _probe_with_ffprobe(VIDEO_FILE),
-        _probe_with_mdls(VIDEO_FILE),
-        _probe_from_env(),
-    )
-    for info in candidates:
+    load_dotenv(BASE_DIR / ".env")
+
+    probes = [
+        ("env", _probe_from_env),
+        ("ffprobe", lambda: _probe_with_ffprobe(VIDEO_FILE) if shutil.which("ffprobe") else None),
+        ("mdls", lambda: _probe_with_mdls(VIDEO_FILE)),
+        ("telethon", lambda: _probe_with_telethon(VIDEO_FILE)),
+    ]
+
+    for name, probe in probes:
+        try:
+            info = probe()
+        except Exception as exc:
+            logger.warning("Video probe '%s' failed: %s", name, exc)
+            continue
         if info is not None:
             logger.info(
-                "Video metadata: %sx%s, %ss",
+                "Video metadata (%s): %sx%s, %ss",
+                name,
                 info.width,
                 info.height,
                 info.duration,
             )
             return info
+        if name == "ffprobe" and not shutil.which("ffprobe"):
+            logger.warning("ffprobe not found — run: sudo apt install ffmpeg -y")
 
-    # Safe default for vertical 9:16 if nothing else works
-    logger.warning("Could not detect video metadata; using default 1080x1920.")
+    logger.warning(
+        "Could not detect video metadata. Add VIDEO_WIDTH/HEIGHT to .env "
+        "or install ffmpeg. Using safe portrait default 1080x1920."
+    )
     return VideoInfo(width=1080, height=1920, duration=60)
+
+
+def build_video_attributes() -> List[TypeDocumentAttribute]:
+    """Build Telegram upload attributes for the video file."""
+    attrs, _ = get_attributes(str(VIDEO_FILE), supports_streaming=True)
+    if VIDEO_INFO is None:
+        return attrs
+
+    filtered = [a for a in attrs if not isinstance(a, DocumentAttributeVideo)]
+    filtered.append(
+        DocumentAttributeVideo(
+            duration=VIDEO_INFO.duration,
+            w=VIDEO_INFO.width,
+            h=VIDEO_INFO.height,
+            supports_streaming=True,
+            round_message=False,
+        )
+    )
+    return filtered
 
 
 def prepare_video_thumb(video_info: VideoInfo) -> Optional[Path]:
@@ -348,32 +400,24 @@ def prepare_video_thumb(video_info: VideoInfo) -> Optional[Path]:
 
 async def send_auto_reply(client: TelegramClient, user_id: int) -> None:
     """Send video first (9:16 portrait), then text message after 1 second."""
-    if VIDEO_INFO is None:
-        raise RuntimeError("Video metadata not loaded.")
-
-    video_attrs = DocumentAttributeVideo(
-        duration=VIDEO_INFO.duration,
-        w=VIDEO_INFO.width,
-        h=VIDEO_INFO.height,
-        supports_streaming=True,
-        round_message=False,
-    )
-
     send_kwargs: Dict = {
         "supports_streaming": True,
         "force_document": False,
-        "attributes": [video_attrs],
+        "attributes": build_video_attributes(),
     }
     if VIDEO_THUMB is not None:
         send_kwargs["thumb"] = str(VIDEO_THUMB)
 
-    await client.send_file(user_id, VIDEO_FILE, **send_kwargs)
-    logger.info(
-        "Sent video to user %s (%sx%s)",
-        user_id,
-        VIDEO_INFO.width,
-        VIDEO_INFO.height,
-    )
+    await client.send_file(user_id, str(VIDEO_FILE), **send_kwargs)
+    if VIDEO_INFO:
+        logger.info(
+            "Sent video to user %s (%sx%s)",
+            user_id,
+            VIDEO_INFO.width,
+            VIDEO_INFO.height,
+        )
+    else:
+        logger.info("Sent video to user %s", user_id)
 
     await asyncio.sleep(MSG_DELAY_SECONDS)
 
@@ -390,7 +434,11 @@ async def main() -> None:
     global VIDEO_INFO, VIDEO_THUMB
 
     validate_files()
-    VIDEO_INFO = load_video_info()
+    try:
+        VIDEO_INFO = load_video_info()
+    except Exception as exc:
+        logger.exception("Video metadata failed, using defaults: %s", exc)
+        VIDEO_INFO = VideoInfo(width=1080, height=1920, duration=60)
     VIDEO_THUMB = prepare_video_thumb(VIDEO_INFO)
 
     api_id, api_hash, session_name = load_config()
