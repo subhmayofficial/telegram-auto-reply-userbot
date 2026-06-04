@@ -291,8 +291,12 @@ def _probe_from_env() -> Optional[VideoInfo]:
 
 def load_video_info() -> VideoInfo:
     """Detect portrait/landscape video metadata for correct Telegram playback."""
-    for probe in (_probe_with_ffprobe, _probe_with_mdls, _probe_from_env):
-        info = probe(VIDEO_FILE)
+    candidates = (
+        _probe_with_ffprobe(VIDEO_FILE),
+        _probe_with_mdls(VIDEO_FILE),
+        _probe_from_env(),
+    )
+    for info in candidates:
         if info is not None:
             logger.info(
                 "Video metadata: %sx%s, %ss",
