@@ -312,30 +312,46 @@ def load_video_info() -> VideoInfo:
     """Detect portrait/landscape video metadata for correct Telegram playback."""
     load_dotenv(BASE_DIR / ".env")
 
-    probes = [
-        ("env", _probe_from_env),
-        ("ffprobe", lambda: _probe_with_ffprobe(VIDEO_FILE) if shutil.which("ffprobe") else None),
-        ("mdls", lambda: _probe_with_mdls(VIDEO_FILE)),
-        ("telethon", lambda: _probe_with_telethon(VIDEO_FILE)),
-    ]
+    def _log_and_return(source: str, info: VideoInfo) -> VideoInfo:
+        logger.info(
+            "Video metadata (%s): %sx%s, %ss",
+            source,
+            info.width,
+            info.height,
+            info.duration,
+        )
+        return info
 
-    for name, probe in probes:
-        try:
-            info = probe()
-        except Exception as exc:
-            logger.warning("Video probe '%s' failed: %s", name, exc)
-            continue
+    try:
+        info = _probe_from_env()
         if info is not None:
-            logger.info(
-                "Video metadata (%s): %sx%s, %ss",
-                name,
-                info.width,
-                info.height,
-                info.duration,
-            )
-            return info
-        if name == "ffprobe" and not shutil.which("ffprobe"):
-            logger.warning("ffprobe not found — run: sudo apt install ffmpeg -y")
+            return _log_and_return("env", info)
+    except Exception as exc:
+        logger.warning("env video probe failed: %s", exc)
+
+    if shutil.which("ffprobe"):
+        try:
+            info = _probe_with_ffprobe(VIDEO_FILE)
+            if info is not None:
+                return _log_and_return("ffprobe", info)
+        except Exception as exc:
+            logger.warning("ffprobe failed: %s", exc)
+    else:
+        logger.warning("ffprobe not found — run: sudo apt install ffmpeg -y")
+
+    try:
+        info = _probe_with_mdls(VIDEO_FILE)
+        if info is not None:
+            return _log_and_return("mdls", info)
+    except Exception as exc:
+        logger.warning("mdls probe failed: %s", exc)
+
+    try:
+        info = _probe_with_telethon(VIDEO_FILE)
+        if info is not None:
+            return _log_and_return("telethon", info)
+    except Exception as exc:
+        logger.warning("telethon probe failed: %s", exc)
 
     logger.warning(
         "Could not detect video metadata. Add VIDEO_WIDTH/HEIGHT to .env "
